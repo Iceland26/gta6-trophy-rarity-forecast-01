@@ -24,6 +24,12 @@ logit moves is wide and asymmetric. The design that won, and that ships:
     the house baseline's 0.5, matching the observed dispersion of week-one
     logit moves — with the upper tail widened a further 18% for trophies
     under 20%, whose rates have far more room to rise than to fall;
+  * in a live (non-flat) history that spread is widened further, by up
+    to 50%, for a trophy whose own rate is still moving fast in the last
+    reads before the checkpoint (mean absolute logit move per day over
+    the last three read intervals): one population-average sigma
+    under-covers a trophy that is demonstrably still in motion, while a
+    settled trophy at the same level keeps the base spread;
   * a trophy still at 0.00% gets median 0.35% with sigma 1.55 (zero earners
     at the checkpoint says little: the fastest players cross late
     thresholds in a bunch during the week);
@@ -47,6 +53,7 @@ import json
 import math
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # The grader's -P leaves /bot off sys.path: put it back first.
@@ -68,6 +75,9 @@ SATURATED_MEDIAN = 99.3        # percent, for a trophy at 99.9%+
 SATURATED_SPREAD = 0.60
 FLAT_SHIFT = -0.85             # logit shift when no refresh was ever seen
 FLAT_MIN_SPREAD = 1.05
+VOL_INTERVALS = 3              # read intervals used to measure recent motion
+VOL_GAIN = 0.30                # spread widening per logit/day of recent motion
+VOL_MAX_EXTRA = 0.50           # cap on that widening (+50%)
 
 
 def clamp_pct(x: float) -> float:
@@ -118,6 +128,46 @@ def last_known_rate(history: list, idx: int):
     return None
 
 
+def parse_time(text):
+    """Epoch seconds for an ISO-8601 read timestamp, else None."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def recent_daily_move(history: list, idx: int):
+    """Mean absolute logit move per day over the trophy's last few reads.
+
+    Sums the absolute logit changes across the last VOL_INTERVALS read
+    intervals in which the trophy's rate is listed, divided by the days
+    those intervals span. Returns None when the recent trajectory cannot
+    be measured (too few timed observations), meaning no widening.
+    """
+    points = []
+    for read in history:
+        rates = read.get("rates") or []
+        if idx < len(rates) and rates[idx] is not None:
+            points.append((read.get("at"), float(rates[idx])))
+    if len(points) < 2:
+        return None
+    move = 0.0
+    days = 0.0
+    tail = points[-(VOL_INTERVALS + 1):]
+    for (t0, r0), (t1, r1) in zip(tail, tail[1:]):
+        s0 = parse_time(t0)
+        s1 = parse_time(t1)
+        if s0 is None or s1 is None or s1 <= s0:
+            continue
+        move += abs(logit(r1) - logit(r0))
+        days += (s1 - s0) / 86400.0
+    if days <= 0:
+        return None
+    return move / days
+
+
 def history_is_flat(history: list) -> bool:
     """True when the page never changed: one tracked count, identical rates.
 
@@ -163,7 +213,11 @@ def forecast_case(case: dict) -> dict:
         elif rate <= 0.0:
             q = quantiles(logit(ZERO_MEDIAN), ZERO_SPREAD, False)
         else:
-            q = quantiles(logit(rate), spread, rate < UPPER_SKEW_BELOW)
+            sig = spread
+            daily = recent_daily_move(history, idx)
+            if daily is not None:
+                sig *= 1.0 + min(VOL_MAX_EXTRA, VOL_GAIN * daily)
+            q = quantiles(logit(rate), sig, rate < UPPER_SKEW_BELOW)
         rows.append({"id": trophy["id"], "q": q})
     return {"trophies": rows}
 
